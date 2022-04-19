@@ -1,5 +1,5 @@
 CC = gcc
-LIBS = -ltinfo
+LIBS = -ltinfo -lpthread
 O = o
 
 PREFIX = /usr/local
