@@ -1,6 +1,7 @@
 CC = gcc
-LIBS = -ltinfo -lpthread
+LIBS = -ltinfo -lpthread -lsensors
 O = o
+CFLAGS = -g3
 
 PREFIX = /usr/local
 

@@ -11,6 +11,16 @@
 #include <errno.h>
 #include <termcap.h>
 
+#include <sensors/sensors.h>
+
+#define BOX_DRAWING_BEG "\x1b(0"
+#define BOX_DRAWING_END "\x1b(B"
+#define VRT BOX_DRAWING_BEG"\x78"BOX_DRAWING_END
+
+#define NORMAL_COLOR "\x1B[0m"
+#define GREEN  "\x1B[32m"
+#define BLUE  "\x1B[34m"
+
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t mutex1 = PTHREAD_MUTEX_INITIALIZER;
 
@@ -107,8 +117,9 @@ struct thread_usage {
 
 struct thread_info {
     int core_id;
-    float frequency;
+    float scaling_cur_freq;
     struct thread_usage usage;
+    double temp;
 };
 
 // increase array size twice if idx is bigger than current size
@@ -119,12 +130,89 @@ void increase_size(struct thread_info** threads, int idx, int* size) {
         if (idx >= *size) {
             *size = idx + 1;
         }
+        printf("Increase size\n");
         *threads = realloc(*threads, sizeof(struct thread_info) * (*size));
         memset(*threads + oldsize, 0, sizeof(struct thread_info) * (*size - oldsize));
     }
 }
 
-int read_thread_info(struct thread_info** threads, int* size) {
+#define CPU_POSSIBLE_PATH "/sys/devices/system/cpu/possible"
+#define READ_MODE "r"
+#define CPU_POLICY_PATTERN "/sys/devices/system/cpu/cpufreq/policy%u/%s"
+#define CPU_TOPOLOGY_PATTERN "/sys/devices/system/cpu/cpu%u/topology/%s"
+
+int init_cpus(struct thread_info** cpus, int* size) {
+    FILE* fp = fopen(CPU_POSSIBLE_PATH, READ_MODE);
+    if (fp == NULL) {
+        fprintf(stderr, "Failed to open the file '%s'.\n", CPU_POSSIBLE_PATH);
+        return -1;
+    }
+
+    char* line = NULL;
+    size_t len = 0;
+    if (getline(&line, &len, fp) == -1) {
+        fprintf(stderr, "Failed to read available cpus.\n");
+        return -1;
+    }
+
+    int beg = 0, end = 0;
+    if (sscanf(line, "%d-%d", &beg, &end) != 2) {
+        fprintf(stderr, "Failed to parse available cpus.\n");
+        return -1;
+    }
+
+    *size = end - beg + 1;
+    *cpus = calloc(*size, sizeof(struct thread_info));
+    if (*cpus == NULL) {
+        fprintf(stderr, "Failed to allocate memory for cpus.\n");
+        return -1;
+    }
+
+    free(line);
+    fclose(fp);
+    return 1;
+}
+
+int read_value_from_file(const char* path, int* value) {
+    FILE* fp = fopen(path, READ_MODE);
+    if (fp == NULL) {
+        fprintf(stderr, "Failed to open the file '%s'.\n", path);
+        return -1;
+    }
+
+    char* line = NULL;
+    size_t len = 0;
+    if (getline(&line, &len, fp) == -1) {
+        fprintf(stderr, "Failed to read value from file.\n");
+        return -1;
+    }
+
+    *value = atoi(line);
+    fclose(fp);
+
+    return 1;
+}
+
+int read_thread_info(struct thread_info* threads, int size) {
+    for (int idx = 0; idx < size; ++idx) {
+        char path[128];
+
+        sprintf(path, CPU_POLICY_PATTERN, idx, "scaling_cur_freq");
+        int scaling_cur_freq = 0;
+        if (read_value_from_file(path, &scaling_cur_freq) == -1) {
+            return -1;
+        }
+        threads[idx].scaling_cur_freq = 1.0 * scaling_cur_freq / 1000.0;
+
+        sprintf(path, CPU_TOPOLOGY_PATTERN, idx, "core_id");
+        if (read_value_from_file(path, &(threads[idx].core_id)) == -1) {
+            return -1;
+        }
+    }
+    return 1;
+}
+
+int read_model_name(char* model_name) {
     FILE* fp = NULL;
     char* filepath = "/proc/cpuinfo";
     if ((fp = fopen(filepath, "r")) == NULL) {
@@ -132,30 +220,22 @@ int read_thread_info(struct thread_info** threads, int* size) {
         return -1;
     }
 
-    if (*size == 0) {
-        *threads = (struct thread_info*)calloc(0, sizeof(struct thread_info));
-        *size = 1;
-    }
-
     char* line = NULL;
     size_t len = 0;
     ssize_t nread = 0;
 
-    int id = 0;
+    int ret = -1;
     while ((nread = getline(&line, &len, fp)) != -1) {
-        if (startswith(line, "processor\t:")) {
-            id = atoi(line + 11);
-            increase_size(threads, id, size);
-        }
-        else if (startswith(line, "cpu MHz\t\t:")) { 
-            (*threads)[id].frequency = atof(line + 10);
-        }
-        else if (startswith(line, "core id\t\t:")) {
-            (*threads)[id].core_id = atoi(line + 10);
+        if (startswith(line, "model name\t: ")) {
+            memcpy(model_name, line + 13, nread - 13);
+            model_name[nread-14] = '\0';
+            ret = 1;
+            break;
         }
     }
-    fclose(fp);
-    return 1;
+
+    free(line);
+    return ret;
 }
 
 int read_thread_usage(struct thread_info** threads, int* size) {
@@ -167,7 +247,7 @@ int read_thread_usage(struct thread_info** threads, int* size) {
     }
 
     if (*size == 0) {
-        *threads = (struct thread_info*)calloc(0, sizeof(struct thread_info));
+        *threads = (struct thread_info*)calloc(1, sizeof(struct thread_info));
         *size = 1;
     }
 
@@ -202,13 +282,73 @@ int read_thread_usage(struct thread_info** threads, int* size) {
     return 1;
 }
 
+int read_cpu_temp(struct thread_info* threads, int size) {
+    const sensors_chip_name* cn = NULL;
+    int c = 0;
+    while ((cn = sensors_get_detected_chips(NULL, &c))) {
+        if (strcmp(cn->prefix, "coretemp") != 0) {
+            continue;
+        }
+        const sensors_feature* feat;
+        int f = 0;
+        while ((feat = sensors_get_features(cn, &f)) != 0) {
+            char * label = sensors_get_label(cn, feat);
+            int core_id = 0;
+            if (!label || sscanf(label, "Core %d", &core_id) != 1) {
+                continue;
+            }
+
+            const sensors_subfeature* temp_input =
+              sensors_get_subfeature(cn, feat, SENSORS_SUBFEATURE_TEMP_INPUT);
+            if (temp_input) {
+                double val = 0.0;
+                if (sensors_get_value(cn, temp_input->number, &val) == 0) {
+                    for (int j = 0; j < size; ++j) {
+                        if (threads[j].core_id == core_id) {
+                            threads[j].temp = val;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+void draw_line(const int* width, int size, char beg, char end, char delim, char fill) {
+    printf("%s", BOX_DRAWING_BEG);
+    putchar(beg);
+    for (int idx = 0; idx < size; ++idx) {
+        for (int j = 0; j < width[idx]; ++j) {
+            putchar(fill);
+        }
+        if (idx != size - 1) {
+            putchar(delim);
+        }
+    }
+    putchar(end);
+    printf("%s", BOX_DRAWING_END);
+}
+
+void draw_top_line(const int* width, int size) {
+    draw_line(width, size, 0x6c, 0x6b, 0x77, 0x71);
+}
+
+void draw_middle_line(const int* width, int size) {
+    draw_line(width, size, 0x74, 0x75, 0x6e, 0x71);
+}
+
+void draw_bottom_line(const int* width, int size) {
+    draw_line(width, size, 0x6d, 0x6a, 0x76, 0x71);
+}
+
 void print_thread_info(const struct thread_info* threads, int size) {
     for (size_t idx = 0; idx < size; ++idx) {
-        printf("| %6i | %4i | %10.3f | %4d% |\n",
-                idx, threads[idx].core_id,
-                threads[idx].frequency, threads[idx].usage.usage);
+        printf("%s %6i %s %4i %s %10.3f %s %8.1f %s %4d%% %s\n",
+                VRT, idx, VRT, threads[idx].core_id, VRT,
+                threads[idx].scaling_cur_freq, VRT,
+                threads[idx].temp, VRT,
+                threads[idx].usage.usage, VRT);
     }
-    fflush(stdout);
 }
 
 static char
@@ -218,16 +358,34 @@ static char
     *sc_cursor_invisible,
     *sc_cursor_normal;
 
-// move cursor into the begin position
-void move_cursor(int hpos, int vpos) {
-    if (sc_move != NULL) {
-        char* go = tgoto(sc_move, hpos, vpos);
-        tputs(go, 1, putchar);
+// move cursor into the given position
+void move_cursor(const char* command, int hpos, int vpos) {
+    if (command != NULL) {
+        char* go = tgoto(command, hpos, vpos);
+        if (go != NULL) {
+            tputs(go, 1, putchar);
+        }
     }
 }
 
+void move_cursor_up(int lines) {
+    printf("\033[%dA", lines);
+}
+
+void move_cursor_backward(int columns) {
+    printf("\033[%dD", columns);
+}
+
+
 int main(int argc, char* argv[])
 {
+    bool fullscreen_mode = false;
+    for (int idx = 1; idx < argc; ++idx) {
+        if (strcmp(argv[idx], "--fullscreen") == 0) {
+            fullscreen_mode = true;
+        }
+    }
+
     char *termtype = getenv("TERM");
     if (termtype == NULL) {
         termtype = "unknown";
@@ -235,12 +393,16 @@ int main(int argc, char* argv[])
     static char termbuf[2048];
     tgetent(termbuf, termtype);
 
-    // init strings of comands
+    // init strings of commands
     sc_init = tgetstr("ti", NULL);
     sc_deinit = tgetstr("te", NULL);
     sc_move = tgetstr("cm", NULL);
     sc_cursor_invisible = tgetstr("vi", NULL);
     sc_cursor_normal = tgetstr("ve", NULL);
+
+    if (fullscreen_mode && sc_init == NULL) {
+        fullscreen_mode = false;
+    }
 
     // set custom signal handler
     struct sigaction sa;
@@ -249,6 +411,12 @@ int main(int argc, char* argv[])
 
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    // init sensors lib
+    bool sensors = true;
+    if (sensors_init(NULL) != 0) {
+        sensors = false;
+    }
 
     // run second thread to process key presses
     pthread_t th;
@@ -259,54 +427,85 @@ int main(int argc, char* argv[])
 
     struct thread_info* threads = NULL;
     int thread_count = 0;
+    init_cpus(&threads, &thread_count);
 
     // init fullscreen mode
-    fputs(sc_init, stdout);
-    move_cursor(0, 0);
+    if (fullscreen_mode) {
+        fputs(sc_init, stdout);
+        move_cursor(sc_move, 0, 0);
+    }
 
-    const char* delim = "--------------------------------------"; 
+    char model_name[128];
+    int is_read_model_name = read_model_name(model_name);
+    if (is_read_model_name == 1) {
+        printf("Processor: %s%s%s\n", BLUE, model_name, NORMAL_COLOR);
+    }
 
     // print headers
-    puts(delim);
-    printf("| %6s | %4s | %10s | %5s |\n", "Thread", "Core", "Speed, MHz", "Usage");
-    puts(delim);
+    int width[] = {8, 6, 12, 10, 7};
+    size_t width_sz = sizeof(width) / sizeof(int);
+    draw_top_line(width, width_sz);
+    printf("\n%s %6s %s %4s %s %10s %s %8s %s %5s %s\n",
+            VRT, "Thread", VRT, "Core",
+            VRT, "Speed, MHz", VRT, "Temp, °C" , VRT, "Usage", VRT);
+    draw_middle_line(width, width_sz);
+    printf("\n");
 
     // set invisible cursor
-    tputs(sc_cursor_invisible, 1, putchar); 
+    tputs(sc_cursor_invisible, 1, putchar);
 
     pthread_mutex_lock(&mutex1);
 
     while (true) {
-        if (-1 == read_thread_info(&threads, &thread_count)) {
+        if (-1 == read_thread_info(threads, thread_count)) {
             break;
         }
-        
+
         if (-1 == read_thread_usage(&threads, &thread_count)) {
             break;
         }
- 
+
+        read_cpu_temp(threads, thread_count);
+
         print_thread_info(threads, thread_count);
-        puts(delim);
- 
-        // move cursor back
-        move_cursor(0, 3);
+        draw_bottom_line(width, width_sz);
+        fflush(stdout);
 
         // wait for 2 second
         if (wait_for(&cond, &mutex1, 2000000000) != 0) {
             break;
+        }
+
+        // move cursor back
+        if (fullscreen_mode) {
+            move_cursor(sc_move, 0, 4);
+        } else {
+            move_cursor_up(thread_count);
+            move_cursor_backward(49);
         }
     }
 
     pthread_mutex_unlock(&mutex1);
 
     // set cursor normal mode back
-    tputs(sc_cursor_normal, 1, putchar); 
+    tputs(sc_cursor_normal, 1, putchar);
 
     pthread_join(th, NULL);
+
+    if (sensors) {
+        sensors_cleanup();
+    }
+
     // exit fullscreen mode
-    fputs(sc_deinit, stdout);
+    if (fullscreen_mode && sc_deinit != NULL) {
+        fputs(sc_deinit, stdout);
+    }
 
     free(threads);
+
+    if (!fullscreen_mode) {
+        printf("\n");
+    }
     return 0;
 }
 
