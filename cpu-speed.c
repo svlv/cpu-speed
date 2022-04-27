@@ -376,6 +376,7 @@ int read_cpu_temp(struct thread_info* threads, int size) {
     }
 }
 
+// Draw line with the given chars
 void draw_line(const int* width, int size, char beg, char end, char delim, char fill) {
     printf("%s", BOX_DRAWING_BEG);
     putchar(beg);
@@ -537,9 +538,15 @@ int main(int argc, char* argv[])
             break;
         }
 
-        read_cpu_temp(threads, thread_count);
+        if (sensors) {
+            if (-1 == read_cpu_temp(threads, thread_count)) {
+                break;
+            }
+        }
 
-        set_online(threads, thread_count);
+        if (-1 == set_online(threads, thread_count)) {
+            break;
+        }
 
         print_thread_info(threads, thread_count);
         draw_bottom_line(width, width_sz);
