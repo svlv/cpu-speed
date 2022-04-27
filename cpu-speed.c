@@ -120,6 +120,7 @@ struct thread_info {
     float scaling_cur_freq;
     struct thread_usage usage;
     double temp;
+    int online;
 };
 
 // increase array size twice if idx is bigger than current size
@@ -137,6 +138,7 @@ void increase_size(struct thread_info** threads, int idx, int* size) {
 }
 
 #define CPU_POSSIBLE_PATH "/sys/devices/system/cpu/possible"
+#define CPU_ONLINE_PATH "/sys/devices/system/cpu/online"
 #define READ_MODE "r"
 #define CPU_POLICY_PATTERN "/sys/devices/system/cpu/cpufreq/policy%u/%s"
 #define CPU_TOPOLOGY_PATTERN "/sys/devices/system/cpu/cpu%u/topology/%s"
@@ -173,6 +175,41 @@ int init_cpus(struct thread_info** cpus, int* size) {
     return 1;
 }
 
+int set_online(struct thread_info* cpus, int size) {
+    FILE* fp = fopen(CPU_ONLINE_PATH, READ_MODE);
+    if (fp == NULL) {
+       fprintf(stderr, "Failed to open the file '%s'.\n", CPU_ONLINE_PATH);
+       return -1;
+    }
+
+    char* line = NULL;
+    size_t len = 0;
+    char delim = ',';
+
+    ssize_t sz = 0;
+
+    for (int idx = 0; idx < size; ++idx) {
+      cpus[idx].online = 0;
+    }
+
+    while ((sz = getdelim(&line, &len, delim, fp)) != -1) {
+        int beg = 0, end = 0;
+        if (line[sz-1] == delim) {
+          line[sz-1] = '\0';
+        }
+        if (sscanf(line, "%d-%d", &beg, &end) == 2) {
+          for (;beg <= end; ++beg) {
+              cpus[beg].online = 1;
+          }
+        } else if (sscanf(line, "%d", &beg) == 1) {
+          cpus[beg].online = 1;
+        }
+    }
+    free(line);
+    fclose(fp);
+    return 1;
+}
+
 int read_value_from_file(const char* path, int* value) {
     FILE* fp = fopen(path, READ_MODE);
     if (fp == NULL) {
@@ -195,6 +232,9 @@ int read_value_from_file(const char* path, int* value) {
 
 int read_thread_info(struct thread_info* threads, int size) {
     for (int idx = 0; idx < size; ++idx) {
+        if (!threads[idx].online) {
+          continue;
+        }
         char path[128];
 
         sprintf(path, CPU_POLICY_PATTERN, idx, "scaling_cur_freq");
@@ -286,30 +326,52 @@ int read_cpu_temp(struct thread_info* threads, int size) {
     const sensors_chip_name* cn = NULL;
     int c = 0;
     while ((cn = sensors_get_detected_chips(NULL, &c))) {
-        if (strcmp(cn->prefix, "coretemp") != 0) {
-            continue;
-        }
-        const sensors_feature* feat;
-        int f = 0;
-        while ((feat = sensors_get_features(cn, &f)) != 0) {
-            char * label = sensors_get_label(cn, feat);
-            int core_id = 0;
-            if (!label || sscanf(label, "Core %d", &core_id) != 1) {
-                continue;
-            }
+        // For Intel processors
+        if (strcmp(cn->prefix, "coretemp") == 0) {
+            const sensors_feature* feat;
+            int f = 0;
+            while ((feat = sensors_get_features(cn, &f)) != 0) {
+                char * label = sensors_get_label(cn, feat);
+                int core_id = 0;
+                if (!label || sscanf(label, "Core %d", &core_id) != 1) {
+                    continue;
+                }
 
-            const sensors_subfeature* temp_input =
-              sensors_get_subfeature(cn, feat, SENSORS_SUBFEATURE_TEMP_INPUT);
-            if (temp_input) {
-                double val = 0.0;
-                if (sensors_get_value(cn, temp_input->number, &val) == 0) {
-                    for (int j = 0; j < size; ++j) {
-                        if (threads[j].core_id == core_id) {
-                            threads[j].temp = val;
+                const sensors_subfeature* temp_input =
+                  sensors_get_subfeature(cn, feat, SENSORS_SUBFEATURE_TEMP_INPUT);
+                if (temp_input) {
+                    double val = 0.0;
+                    if (sensors_get_value(cn, temp_input->number, &val) == 0) {
+                        for (int j = 0; j < size; ++j) {
+                            if (threads[j].core_id == core_id) {
+                                threads[j].temp = val;
+                            }
                         }
                     }
                 }
             }
+            break;
+        }
+        // For AMD processors
+        else if (strcmp(cn->prefix, "k10temp") == 0) {
+            const sensors_feature* feat;
+            int f = 0;
+            while ((feat = sensors_get_features(cn, &f)) != 0) {
+                char * label = sensors_get_label(cn, feat);
+                if (strcmp(label, "Tctl") == 0) {
+                    const sensors_subfeature* temp_input =
+                      sensors_get_subfeature(cn, feat, SENSORS_SUBFEATURE_TEMP_INPUT);
+                    if (temp_input) {
+                        double val = 0.0;
+                        if (sensors_get_value(cn, temp_input->number, &val) == 0) {
+                            for (int j = 0; j < size; ++j) {
+                                threads[j].temp = val;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
         }
     }
 }
@@ -343,11 +405,21 @@ void draw_bottom_line(const int* width, int size) {
 
 void print_thread_info(const struct thread_info* threads, int size) {
     for (size_t idx = 0; idx < size; ++idx) {
-        printf("%s %6i %s %4i %s %10.3f %s %8.1f %s %4d%% %s\n",
+        if (threads[idx].online) {
+        printf("%s %6i %s %4i %s %6i %s %10.3f %s %8.1f %s %4d%% %s\n",
                 VRT, idx, VRT, threads[idx].core_id, VRT,
+                threads[idx].online, VRT,
                 threads[idx].scaling_cur_freq, VRT,
                 threads[idx].temp, VRT,
                 threads[idx].usage.usage, VRT);
+        } else {
+        printf("%s %6i %s %4i %s %6i %s %10.3f %s %8.1f %s %4d%% %s\n",
+                VRT, idx, VRT, threads[idx].core_id, VRT,
+                threads[idx].online, VRT,
+                0.0, VRT,
+                0.0, VRT,
+                0, VRT);
+        }
     }
 }
 
@@ -375,7 +447,6 @@ void move_cursor_up(int lines) {
 void move_cursor_backward(int columns) {
     printf("\033[%dD", columns);
 }
-
 
 int main(int argc, char* argv[])
 {
@@ -442,11 +513,12 @@ int main(int argc, char* argv[])
     }
 
     // print headers
-    int width[] = {8, 6, 12, 10, 7};
+    int width[] = {8, 6, 8, 12, 10, 7};
     size_t width_sz = sizeof(width) / sizeof(int);
     draw_top_line(width, width_sz);
-    printf("\n%s %6s %s %4s %s %10s %s %8s %s %5s %s\n",
+    printf("\n%s %6s %s %4s %s %6s %s %10s %s %8s %s %5s %s\n",
             VRT, "Thread", VRT, "Core",
+            VRT, "Online",
             VRT, "Speed, MHz", VRT, "Temp, °C" , VRT, "Usage", VRT);
     draw_middle_line(width, width_sz);
     printf("\n");
@@ -467,6 +539,8 @@ int main(int argc, char* argv[])
 
         read_cpu_temp(threads, thread_count);
 
+        set_online(threads, thread_count);
+
         print_thread_info(threads, thread_count);
         draw_bottom_line(width, width_sz);
         fflush(stdout);
@@ -481,7 +555,7 @@ int main(int argc, char* argv[])
             move_cursor(sc_move, 0, 4);
         } else {
             move_cursor_up(thread_count);
-            move_cursor_backward(49);
+            move_cursor_backward(58);
         }
     }
 
