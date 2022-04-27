@@ -1,7 +1,9 @@
 CC = gcc
 LIBS = -ltinfo -lpthread -lsensors
 O = o
-CFLAGS = -g3
+
+# It's used for debug
+# CFLAGS = -g3
 
 PREFIX = /usr/local
 
