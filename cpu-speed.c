@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -10,8 +11,13 @@
 #include <time.h>
 #include <errno.h>
 #include <termcap.h>
-
 #include <sensors/sensors.h>
+
+#define CPU_POSSIBLE_PATH "/sys/devices/system/cpu/possible"
+#define CPU_ONLINE_PATH "/sys/devices/system/cpu/online"
+#define CPU_POLICY_PATTERN "/sys/devices/system/cpu/cpufreq/policy%u/%s"
+#define CPU_TOPOLOGY_PATTERN "/sys/devices/system/cpu/cpu%u/topology/%s"
+#define READ_MODE "r"
 
 #define BOX_DRAWING_BEG "\x1b(0"
 #define BOX_DRAWING_END "\x1b(B"
@@ -28,17 +34,34 @@ void sig_handler(int signum) {
     pthread_cond_broadcast(&cond);
 }
 
-// check if an string starts with a begin substring
-bool startswith(const char* str, const char* substr) {
+// Checks if a string starts with the specified prefix
+bool startswith(const char* str, const char* prefix) {
     while (*str != '\0') {
-        if (*substr == '\0') {
+        if (*prefix == '\0') {
             return true;
         }
-        if (*str++ != *substr++) {
+        if (*str++ != *prefix++) {
             return false;
         }
     }
     return false;
+}
+
+void log_err(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+
+    char msg[1024];
+    vsnprintf(msg, sizeof(msg)/sizeof(char), format, args);
+
+    va_end(args);
+
+    if (errno == 0) {
+        fprintf(stderr, "%s.\n", msg);
+    } else {
+        char* err_msg = strerror(errno);
+        fprintf(stderr, "%s: %s.\n", msg, err_msg);
+    }
 }
 
 void add_nsec(struct timespec* ts, int64_t nsec) {
@@ -48,11 +71,13 @@ void add_nsec(struct timespec* ts, int64_t nsec) {
     if (nsec > 999999999) {
         ts->tv_sec += nsec / 1000000000;
         ts->tv_nsec = nsec % 1000000000;
+    } else {
+        ts->tv_nsec = nsec;
     }
 }
 
-// block the current thread for the given nanoseconds
-int wait_for(pthread_cond_t* var, pthread_mutex_t* m, int nsec) {
+// Block the current thread for the given nanoseconds
+int wait_for(pthread_cond_t* var, pthread_mutex_t* m, int64_t nsec) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     add_nsec(&ts, nsec);
@@ -64,7 +89,7 @@ int wait_for(pthread_cond_t* var, pthread_mutex_t* m, int nsec) {
         return 0;
     }
 
-    fprintf(stderr, "\npthread_cond_timedwait is failed with: %i\n", res);
+    log_err("Failed to wait on condition variable: %s", strerror(res));
     return -1;
 }
 
@@ -82,18 +107,19 @@ void* process_key_press(void* data) {
     new_term_attr.c_cc[VMIN] = 0;
 
     tcsetattr(fileno(stdin), TCSANOW, &new_term_attr);
-    
+
     while (true) {
         pthread_mutex_lock(&mutex1);
 
         char ch = '\0';
-        if (read(fileno(stdin), &ch, 1 > 0)) {
+        if (read(fileno(stdin), &ch, 1) > 0) {
             // Quite on q
             if (ch == 'q') {
                 break;
             }
         }
 
+        // wait for 100ms
         if (wait_for(&cond, &mutex1, 100000000) != 0) {
             break;
         }
@@ -137,33 +163,39 @@ void increase_size(struct thread_info** threads, int idx, int* size) {
     }
 }
 
-#define CPU_POSSIBLE_PATH "/sys/devices/system/cpu/possible"
-#define CPU_ONLINE_PATH "/sys/devices/system/cpu/online"
-#define READ_MODE "r"
-#define CPU_POLICY_PATTERN "/sys/devices/system/cpu/cpufreq/policy%u/%s"
-#define CPU_TOPOLOGY_PATTERN "/sys/devices/system/cpu/cpu%u/topology/%s"
-
+// Reads from the file the possible number of cpus and allocate memory
+// On success returns 1 otherwise -1
 int init_cpus(struct thread_info** cpus, int* size) {
     FILE* fp = fopen(CPU_POSSIBLE_PATH, READ_MODE);
     if (fp == NULL) {
-        fprintf(stderr, "Failed to open the file '%s'.\n", CPU_POSSIBLE_PATH);
+        fprintf(stderr, "Failed to open %s.", CPU_POSSIBLE_PATH);
         return -1;
     }
 
     char* line = NULL;
     size_t len = 0;
     if (getline(&line, &len, fp) == -1) {
-        fprintf(stderr, "Failed to read available cpus.\n");
+        fprintf(stderr, "Failed to read available cpus from %s.",
+                        CPU_POSSIBLE_PATH);
         return -1;
     }
+
+    char* errmsg = "Failed to parse possible cpus."
+                   " Expected format: %d-%d or 1.\n";
 
     int beg = 0, end = 0;
-    if (sscanf(line, "%d-%d", &beg, &end) != 2) {
-        fprintf(stderr, "Failed to parse available cpus.\n");
+    if (sscanf(line, "%d-%d", &beg, &end) == 2) {
+        *size = end - beg + 1;
+    } else if (sscanf(line, "%d", size) == 1) {
+        if (*size != 1) {
+            fprintf(stderr, errmsg);
+            return -1;
+        }
+    } else {
+        fprintf(stderr, errmsg);
         return -1;
     }
 
-    *size = end - beg + 1;
     *cpus = calloc(*size, sizeof(struct thread_info));
     if (*cpus == NULL) {
         fprintf(stderr, "Failed to allocate memory for cpus.\n");
@@ -174,6 +206,7 @@ int init_cpus(struct thread_info** cpus, int* size) {
     fclose(fp);
     return 1;
 }
+
 
 int set_online(struct thread_info* cpus, int size) {
     FILE* fp = fopen(CPU_ONLINE_PATH, READ_MODE);
@@ -194,9 +227,6 @@ int set_online(struct thread_info* cpus, int size) {
 
     while ((sz = getdelim(&line, &len, delim, fp)) != -1) {
         int beg = 0, end = 0;
-        if (line[sz-1] == delim) {
-          line[sz-1] = '\0';
-        }
         if (sscanf(line, "%d-%d", &beg, &end) == 2) {
           for (;beg <= end; ++beg) {
               cpus[beg].online = 1;
@@ -213,18 +243,20 @@ int set_online(struct thread_info* cpus, int size) {
 int read_value_from_file(const char* path, int* value) {
     FILE* fp = fopen(path, READ_MODE);
     if (fp == NULL) {
-        fprintf(stderr, "Failed to open the file '%s'.\n", path);
+        log_err("Failed to open the file %s", path);
         return -1;
     }
 
     char* line = NULL;
     size_t len = 0;
     if (getline(&line, &len, fp) == -1) {
-        fprintf(stderr, "Failed to read value from file.\n");
+        free(line);
+        log_err("Failed to read value from file");
         return -1;
     }
 
     *value = atoi(line);
+    free(line);
     fclose(fp);
 
     return 1;
@@ -499,7 +531,9 @@ int main(int argc, char* argv[])
 
     struct thread_info* threads = NULL;
     int thread_count = 0;
-    init_cpus(&threads, &thread_count);
+    if (init_cpus(&threads, &thread_count) == -1) {
+        return 1;
+    }
 
     // init fullscreen mode
     if (fullscreen_mode) {
@@ -527,25 +561,30 @@ int main(int argc, char* argv[])
     // set invisible cursor
     tputs(sc_cursor_invisible, 1, putchar);
 
-    pthread_mutex_lock(&mutex1);
+    bool break_on_error = false;
 
+    pthread_mutex_lock(&mutex1);
     while (true) {
+        if (-1 == set_online(threads, thread_count)) {
+            break_on_error = true;
+            break;
+        }
+
         if (-1 == read_thread_info(threads, thread_count)) {
+            break_on_error = true;
             break;
         }
 
         if (-1 == read_thread_usage(&threads, &thread_count)) {
+            break_on_error = true;
             break;
         }
 
         if (sensors) {
             if (-1 == read_cpu_temp(threads, thread_count)) {
+                break_on_error = true;
                 break;
             }
-        }
-
-        if (-1 == set_online(threads, thread_count)) {
-            break;
         }
 
         print_thread_info(threads, thread_count);
@@ -565,13 +604,18 @@ int main(int argc, char* argv[])
             move_cursor_backward(58);
         }
     }
-
     pthread_mutex_unlock(&mutex1);
+
+    if (break_on_error) {
+        pthread_cond_signal(&cond);
+    }
 
     // set cursor normal mode back
     tputs(sc_cursor_normal, 1, putchar);
 
     pthread_join(th, NULL);
+    pthread_cond_destroy(&cond);
+    pthread_mutex_destroy(&mutex1);
 
     if (sensors) {
         sensors_cleanup();
