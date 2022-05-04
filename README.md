@@ -28,7 +28,7 @@ sudo make install
 ```
 
 # Usage
-Cpu-speed supports the full screen mode:
+It supports the full screen mode:
 ```
 cpu-speed --fullscreen
 ```
