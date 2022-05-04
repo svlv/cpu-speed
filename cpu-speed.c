@@ -13,6 +13,8 @@
 #include <termcap.h>
 #include <sensors/sensors.h>
 
+#define CPUINFO_PATH "/proc/cpuinfo"
+#define PROCSTAT_PATH "/proc/stat"
 #define CPU_POSSIBLE_PATH "/sys/devices/system/cpu/possible"
 #define CPU_ONLINE_PATH "/sys/devices/system/cpu/online"
 #define CPU_POLICY_PATTERN "/sys/devices/system/cpu/cpufreq/policy%u/%s"
@@ -77,6 +79,8 @@ void add_nsec(struct timespec* ts, int64_t nsec) {
 }
 
 // Block the current thread for the given nanoseconds
+// On success returns 0, if the specified duration has passed returns 1
+// if an error occurs returns -1
 int wait_for(pthread_cond_t* var, pthread_mutex_t* m, int64_t nsec) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -168,37 +172,36 @@ void increase_size(struct thread_info** threads, int idx, int* size) {
 int init_cpus(struct thread_info** cpus, int* size) {
     FILE* fp = fopen(CPU_POSSIBLE_PATH, READ_MODE);
     if (fp == NULL) {
-        fprintf(stderr, "Failed to open %s.", CPU_POSSIBLE_PATH);
+        log_err("Failed to open %s", CPU_POSSIBLE_PATH);
         return -1;
     }
 
     char* line = NULL;
     size_t len = 0;
     if (getline(&line, &len, fp) == -1) {
-        fprintf(stderr, "Failed to read available cpus from %s.",
-                        CPU_POSSIBLE_PATH);
+        log_err("Failed to read available cpus from %s", CPU_POSSIBLE_PATH);
         return -1;
     }
 
-    char* errmsg = "Failed to parse possible cpus."
-                   " Expected format: %d-%d or 1.\n";
+    char* errmsg = "Failed to parse possible cpus. "
+                   "Expected format: %d-%d or 1";
 
     int beg = 0, end = 0;
     if (sscanf(line, "%d-%d", &beg, &end) == 2) {
         *size = end - beg + 1;
     } else if (sscanf(line, "%d", size) == 1) {
         if (*size != 1) {
-            fprintf(stderr, errmsg);
+            log_err(errmsg);
             return -1;
         }
     } else {
-        fprintf(stderr, errmsg);
+        log_err(errmsg);
         return -1;
     }
 
     *cpus = calloc(*size, sizeof(struct thread_info));
     if (*cpus == NULL) {
-        fprintf(stderr, "Failed to allocate memory for cpus.\n");
+        log_err("Failed to allocate memory for cpus");
         return -1;
     }
 
@@ -207,12 +210,15 @@ int init_cpus(struct thread_info** cpus, int* size) {
     return 1;
 }
 
-
 int set_online(struct thread_info* cpus, int size) {
     FILE* fp = fopen(CPU_ONLINE_PATH, READ_MODE);
     if (fp == NULL) {
-       fprintf(stderr, "Failed to open the file '%s'.\n", CPU_ONLINE_PATH);
-       return -1;
+        log_err("Failed to open %s", CPU_ONLINE_PATH);
+        return -1;
+    }
+
+    for (int idx = 0; idx < size; ++idx) {
+      cpus[idx].online = 0;
     }
 
     char* line = NULL;
@@ -220,11 +226,6 @@ int set_online(struct thread_info* cpus, int size) {
     char delim = ',';
 
     ssize_t sz = 0;
-
-    for (int idx = 0; idx < size; ++idx) {
-      cpus[idx].online = 0;
-    }
-
     while ((sz = getdelim(&line, &len, delim, fp)) != -1) {
         int beg = 0, end = 0;
         if (sscanf(line, "%d-%d", &beg, &end) == 2) {
@@ -284,11 +285,11 @@ int read_thread_info(struct thread_info* threads, int size) {
     return 1;
 }
 
+// Returns 1 on success otherwise -1
 int read_model_name(char* model_name) {
     FILE* fp = NULL;
-    char* filepath = "/proc/cpuinfo";
-    if ((fp = fopen(filepath, "r")) == NULL) {
-        fprintf(stderr, "Failed to open %s", filepath);
+    if ((fp = fopen(CPUINFO_PATH, READ_MODE)) == NULL) {
+        log_err("Failed to open %s", CPUINFO_PATH);
         return -1;
     }
 
@@ -298,9 +299,11 @@ int read_model_name(char* model_name) {
 
     int ret = -1;
     while ((nread = getline(&line, &len, fp)) != -1) {
-        if (startswith(line, "model name\t: ")) {
-            memcpy(model_name, line + 13, nread - 13);
-            model_name[nread-14] = '\0';
+        const char* prefix = "model name\t: ";
+        size_t sz = 13;
+        if (startswith(line, prefix)) {
+            memcpy(model_name, line + sz, nread - sz);
+            model_name[nread-sz-1] = '\0';
             ret = 1;
             break;
         }
@@ -312,9 +315,8 @@ int read_model_name(char* model_name) {
 
 int read_thread_usage(struct thread_info** threads, int* size) {
     FILE* fp = NULL;
-    char* filepath = "/proc/stat";
-    if ((fp = fopen(filepath, "r")) == NULL) {
-        fprintf(stderr, "Failed to open %s", filepath);
+    if ((fp = fopen(PROCSTAT_PATH, READ_MODE)) == NULL) {
+        log_err("Failed to open %s", PROCSTAT_PATH);
         return -1;
     }
 
@@ -526,12 +528,14 @@ int main(int argc, char* argv[])
     pthread_t th;
     int ret = pthread_create(&th, NULL, &process_key_press, NULL);
     if (ret != 0) {
-        fprintf(stderr, "\npthread_create is failed with: %i\n", ret);
+        log_err("Failed to create a thread: %s", strerror(ret));
+        return 1;
     }
 
     struct thread_info* threads = NULL;
     int thread_count = 0;
     if (init_cpus(&threads, &thread_count) == -1) {
+        log_err("Error during initialization");
         return 1;
     }
 
