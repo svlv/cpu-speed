@@ -1,7 +1,7 @@
 # CPU clock speed monitor for Linux
 Display frequency and usage for each thread in a terminal
 
-![alt text](http://www.rabina.xyz/images/cpu-speed2.gif "Cpu speed")
+![alt text](https://ewr1.vultrobjects.com/cpu-speed/images/cpu-speed.gif "Cpu speed")
 
 # Dependencies
 - `lm_sensors` library is used to get data from cpu sensors.
