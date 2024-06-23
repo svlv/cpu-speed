@@ -15,11 +15,10 @@ cpu-speed: ${OBJ}
 	$(CC) -o $@ ${OBJ} ${LIBS}
 
 install: all
-	cp cpu-speed ${PREFIX}/bin
+	install -D -v cpu-speed ${PREFIX}/bin/cpu-speed
 
 uninstall:
 	rm -f ${PREFIX}/bin/cpu-speed
 
 clean:
 	rm -f *.${O} cpu-speed
-
