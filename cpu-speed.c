@@ -1,23 +1,22 @@
-#include <stdio.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sensors/sensors.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <pthread.h>
 #include <string.h>
-#include <termios.h>
-#include <pthread.h>
-#include <signal.h>
-#include <time.h>
-#include <errno.h>
 #include <termcap.h>
-#include <sensors/sensors.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
 
 #define CPUINFO_PATH "/proc/cpuinfo"
 #define PROCSTAT_PATH "/proc/stat"
-#define CPU_POSSIBLE_PATH "/sys/devices/system/cpu/possible"
+#define CPU_PRESENT_PATH "/sys/devices/system/cpu/present"
 #define CPU_ONLINE_PATH "/sys/devices/system/cpu/online"
-#define CPU_POLICY_PATTERN "/sys/devices/system/cpu/cpufreq/policy%u/%s"
+#define CPU_FREQ_PATTERN "/sys/devices/system/cpu/cpu%u/cpufreq/%s"
 #define CPU_TOPOLOGY_PATTERN "/sys/devices/system/cpu/cpu%u/topology/%s"
 #define READ_MODE "r"
 
@@ -170,16 +169,16 @@ void increase_size(struct thread_info** threads, int idx, int* size) {
 // Reads from the file the possible number of cpus and allocate memory
 // On success returns 1 otherwise -1
 int init_cpus(struct thread_info** cpus, int* size) {
-    FILE* fp = fopen(CPU_POSSIBLE_PATH, READ_MODE);
+    FILE* fp = fopen(CPU_PRESENT_PATH, READ_MODE);
     if (fp == NULL) {
-        log_err("Failed to open %s", CPU_POSSIBLE_PATH);
+        log_err("Failed to open %s", CPU_PRESENT_PATH);
         return -1;
     }
 
     char* line = NULL;
     size_t len = 0;
     if (getline(&line, &len, fp) == -1) {
-        log_err("Failed to read available cpus from %s", CPU_POSSIBLE_PATH);
+        log_err("Failed to read available cpus from %s", CPU_PRESENT_PATH);
         return -1;
     }
 
@@ -270,7 +269,7 @@ int read_thread_info(struct thread_info* threads, int size) {
         }
         char path[128];
 
-        sprintf(path, CPU_POLICY_PATTERN, idx, "scaling_cur_freq");
+        sprintf(path, CPU_FREQ_PATTERN, idx, "scaling_cur_freq");
         int scaling_cur_freq = 0;
         if (read_value_from_file(path, &scaling_cur_freq) == -1) {
             return -1;
@@ -393,6 +392,27 @@ int read_cpu_temp(struct thread_info* threads, int size) {
             while ((feat = sensors_get_features(cn, &f)) != 0) {
                 char * label = sensors_get_label(cn, feat);
                 if (strcmp(label, "Tctl") == 0) {
+                    const sensors_subfeature* temp_input =
+                      sensors_get_subfeature(cn, feat, SENSORS_SUBFEATURE_TEMP_INPUT);
+                    if (temp_input) {
+                        double val = 0.0;
+                        if (sensors_get_value(cn, temp_input->number, &val) == 0) {
+                            for (int j = 0; j < size; ++j) {
+                                threads[j].temp = val;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        // ARMv7 Processor
+        else if (strcmp(cn->prefix, "cpu_thermal") == 0) {
+            const sensors_feature* feat;
+            int f = 0;
+            while ((feat = sensors_get_features(cn, &f)) != 0) {
+                char * label = sensors_get_label(cn, feat);
+                if (strcmp(label, "temp1") == 0) {
                     const sensors_subfeature* temp_input =
                       sensors_get_subfeature(cn, feat, SENSORS_SUBFEATURE_TEMP_INPUT);
                     if (temp_input) {
@@ -637,4 +657,3 @@ int main(int argc, char* argv[])
     }
     return 0;
 }
-
