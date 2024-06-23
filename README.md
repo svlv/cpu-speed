@@ -40,6 +40,6 @@ It reads all necessary data from the `sysfs` virtual filesystem. Below are the f
 | --------------|:---------------------|
 | `/proc/cpuinfo` | General information about CPU |
 | `/proc/stat`    | Data about current usage of each cpu |
-| `/sys/devices/system/cpu/possible` | The list of possible cpuids |
+| `/sys/devices/system/cpu/present` | The list of present cpuids |
 | `/sys/devices/system/cpu/online` | The list of online cpuids |
-| `/sys/devices/system/cpu/cpufreq/policy/` | Data from the driver about the current CPU frequency and topology |
+| `/sys/devices/system/cpu/cpuX/` | Data from the driver about the current CPU frequency and topology |
