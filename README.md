@@ -1,5 +1,5 @@
 # CPU clock speed monitor for Linux
-Display frequency and usage for each thread in a terminal
+`cpu-speed` displays frequency and usage for each thread in a terminal
 
 ![alt text](https://ewr1.vultrobjects.com/cpu-speed/images/cpu-speed.gif "Cpu speed")
 
@@ -28,14 +28,14 @@ sudo make install
 ```
 
 # Usage
-It supports the full screen mode:
+`cpu-speed` supports the full screen mode:
 ```
 cpu-speed --fullscreen
 ```
 To close press `q` or `Ctrl-C`.
 
-# How does it work?
-It reads all necessary data from the `sysfs` virtual filesystem. Below are the files and directories which are used:
+# How it works
+`cpu-speed` reads all necessary data from the `sysfs` virtual filesystem. Below are the files and directories which are used:
 | File or dir path          | Content                  |
 | --------------|:---------------------|
 | `/proc/cpuinfo` | General information about CPU |
