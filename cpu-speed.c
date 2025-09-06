@@ -20,10 +20,6 @@
 #define CPU_TOPOLOGY_PATTERN "/sys/devices/system/cpu/cpu%u/topology/%s"
 #define READ_MODE "r"
 
-#define BOX_DRAWING_BEG "\x1b(0"
-#define BOX_DRAWING_END "\x1b(B"
-#define VRT BOX_DRAWING_BEG"\x78"BOX_DRAWING_END
-
 #define NORMAL_COLOR "\x1B[0m"
 #define GREEN  "\x1B[32m"
 #define BLUE  "\x1B[34m"
@@ -430,9 +426,20 @@ int read_cpu_temp(struct thread_info* threads, int size) {
     }
 }
 
+static char
+    *sc_move,
+    *sc_init,
+    *sc_deinit,
+    *sc_cursor_invisible,
+    *sc_cursor_normal,
+    *smacs, // start ACS mode
+    *rmacs; // return from ACS mode
+
+static char* VRT;
+
 // Draw line with the given chars
 void draw_line(const int* width, int size, char beg, char end, char delim, char fill) {
-    printf("%s", BOX_DRAWING_BEG);
+    fputs(smacs, stdout);
     putchar(beg);
     for (int idx = 0; idx < size; ++idx) {
         for (int j = 0; j < width[idx]; ++j) {
@@ -443,7 +450,7 @@ void draw_line(const int* width, int size, char beg, char end, char delim, char 
         }
     }
     putchar(end);
-    printf("%s", BOX_DRAWING_END);
+    fputs(rmacs, stdout);
 }
 
 void draw_top_line(const int* width, int size) {
@@ -478,12 +485,7 @@ void print_thread_info(const struct thread_info* threads, int size) {
     }
 }
 
-static char
-    *sc_move,
-    *sc_init,
-    *sc_deinit,
-    *sc_cursor_invisible,
-    *sc_cursor_normal;
+
 
 // move cursor into the given position
 void move_cursor(const char* command, int hpos, int vpos) {
@@ -520,11 +522,23 @@ int main(int argc, char* argv[])
     tgetent(termbuf, termtype);
 
     // init strings of commands
+    // https://src.ung.org/lib/c/plain/src/term/tgetstr.c?h=non-posix&id=d82a95f6e907652151f658d140fcd47a26b70976
     sc_init = tgetstr("ti", NULL);
     sc_deinit = tgetstr("te", NULL);
     sc_move = tgetstr("cm", NULL);
     sc_cursor_invisible = tgetstr("vi", NULL);
     sc_cursor_normal = tgetstr("ve", NULL);
+
+    // Box drawing
+    smacs = tgetstr("as", NULL);
+    rmacs = tgetstr("ae", NULL);
+    if (smacs == NULL || rmacs == NULL) {
+        log_err("Alternative Character Set (ACS) is not available");
+        return 1;
+    }
+
+    VRT = (char *)malloc(strlen(smacs) + strlen(rmacs) + 2);
+    sprintf(VRT, "%s%s%s", smacs, "\x78", rmacs);
 
     if (fullscreen_mode && sc_init == NULL) {
         fullscreen_mode = false;
@@ -640,6 +654,8 @@ int main(int argc, char* argv[])
     pthread_join(th, NULL);
     pthread_cond_destroy(&cond);
     pthread_mutex_destroy(&mutex1);
+
+    free(VRT);
 
     if (sensors) {
         sensors_cleanup();
