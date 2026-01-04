@@ -16,6 +16,7 @@
 #define PROCSTAT_PATH "/proc/stat"
 #define CPU_PRESENT_PATH "/sys/devices/system/cpu/present"
 #define CPU_ONLINE_PATH "/sys/devices/system/cpu/online"
+#define CPU_ONLINE_PATTER "/sys/devices/system/cpu/cpu%u/online"
 #define CPU_FREQ_PATTERN "/sys/devices/system/cpu/cpu%u/cpufreq/%s"
 #define CPU_TOPOLOGY_PATTERN "/sys/devices/system/cpu/cpu%u/topology/%s"
 #define READ_MODE "r"
@@ -23,6 +24,7 @@
 #define NORMAL_COLOR "\x1B[0m"
 #define GREEN  "\x1B[32m"
 #define BLUE  "\x1B[34m"
+#define BACKGROUND_BLUE "\x1B[44m"
 
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t mutex1 = PTHREAD_MUTEX_INITIALIZER;
@@ -76,12 +78,12 @@ void add_nsec(struct timespec* ts, int64_t nsec) {
 // Block the current thread for the given nanoseconds
 // On success returns 0, if the specified duration has passed returns 1
 // if an error occurs returns -1
-int wait_for(pthread_cond_t* var, pthread_mutex_t* m, int64_t nsec) {
+int wait_for(pthread_cond_t* cond, pthread_mutex_t* mutex, int64_t nsec) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     add_nsec(&ts, nsec);
 
-    int res = pthread_cond_timedwait(var, m, &ts);
+    int res = pthread_cond_timedwait(cond, mutex, &ts);
     if (res == 0) {
         return 1;
     } else if (res == ETIMEDOUT) {
@@ -91,6 +93,36 @@ int wait_for(pthread_cond_t* var, pthread_mutex_t* m, int64_t nsec) {
     log_err("Failed to wait on condition variable: %s", strerror(res));
     return -1;
 }
+
+struct thread_usage {
+    int total;
+    int active;
+    int usage;
+};
+
+struct thread_info {
+    int core_id;
+    float scaling_cur_freq;
+    struct thread_usage usage;
+    double temp;
+    int online;
+};
+
+struct main_data {
+    struct thread_info* threads;
+    int thread_count;
+    int selected_thread;
+};
+
+// Table column width
+int g_width[] = {8, 6, 8, 12, 10, 7};
+size_t g_width_sz = sizeof(g_width) / sizeof(int);
+
+bool g_fullscreen_mode = false;
+bool g_change_cpu_online = false;
+
+void draw(const struct main_data* data, bool fullscreen_mode,
+          const int* width, int width_sz);
 
 void* process_key_press(void* data) {
     struct termios orig_term_attr;
@@ -107,19 +139,47 @@ void* process_key_press(void* data) {
 
     tcsetattr(fileno(stdin), TCSANOW, &new_term_attr);
 
+    struct main_data *d = (struct main_data *)data;
+
     while (true) {
         pthread_mutex_lock(&mutex1);
 
-        char ch = '\0';
-        if (read(fileno(stdin), &ch, 1) > 0) {
-            // Quite on q
-            if (ch == 'q') {
+        char buf[3];
+        ssize_t sz = read(fileno(stdin), &buf, sizeof(buf) / sizeof(buf[0]));
+        if (sz > 0) {
+            // Quit on q
+            if (sz == 1 && buf[0] == 'q') {
                 break;
+            }
+
+            if (g_change_cpu_online) {
+                // Arrow up
+                if (sz == 3 && buf[0] == 0x1b && buf[1] == 0x5b && buf[2] == 0x41) {
+                    if (d->selected_thread > 0) {
+                        d->selected_thread = d->selected_thread - 1;
+                        // Redraw the table after a selected thread has been changed
+                        draw(d, g_fullscreen_mode, g_width, g_width_sz);
+                    }
+                }
+                // Arrow down
+                if (sz == 3 && buf[0] == 0x1b && buf[1] == 0x5b && buf[2] == 0x42) {
+                    if (d->selected_thread < d->thread_count - 1) {
+                        d->selected_thread = d->selected_thread + 1;
+                        // Redraw the table after a selected thread has been changed
+                        draw(d, g_fullscreen_mode, g_width, g_width_sz);
+                    }
+                }
+
+                if (sz == 1 && buf[0] == 0x0d) {
+                    if (d->threads[d->selected_thread].online) {
+
+                    }
+                }
             }
         }
 
-        // wait for 100ms
-        if (wait_for(&cond, &mutex1, 100000000) != 0) {
+        // wait for 10ms
+        if (wait_for(&cond, &mutex1, 10000000) != 0) {
             break;
         }
 
@@ -133,20 +193,6 @@ void* process_key_press(void* data) {
 
     return NULL;
 }
-
-struct thread_usage {
-    int total;
-    int active;
-    int usage;
-};
-
-struct thread_info {
-    int core_id;
-    float scaling_cur_freq;
-    struct thread_usage usage;
-    double temp;
-    int online;
-};
 
 // increase array size twice if idx is bigger than current size
 void increase_size(struct thread_info** threads, int idx, int* size) {
@@ -205,7 +251,7 @@ int init_cpus(struct thread_info** cpus, int* size) {
     return 1;
 }
 
-int set_online(struct thread_info* cpus, int size) {
+int read_online(struct thread_info* cpus, int size) {
     FILE* fp = fopen(CPU_ONLINE_PATH, READ_MODE);
     if (fp == NULL) {
         log_err("Failed to open %s", CPU_ONLINE_PATH);
@@ -234,6 +280,9 @@ int set_online(struct thread_info* cpus, int size) {
     free(line);
     fclose(fp);
     return 1;
+}
+
+int reset_cpu_online() {
 }
 
 int read_value_from_file(const char* path, int* value) {
@@ -424,6 +473,8 @@ int read_cpu_temp(struct thread_info* threads, int size) {
             break;
         }
     }
+
+    return 0;
 }
 
 static char
@@ -465,27 +516,33 @@ void draw_bottom_line(const int* width, int size) {
     draw_line(width, size, 0x6d, 0x6a, 0x76, 0x71);
 }
 
-void print_thread_info(const struct thread_info* threads, int size) {
+void print_thread_info(const struct thread_info* threads, int size, int selected_thread) {
     for (size_t idx = 0; idx < size; ++idx) {
+        printf("%s", VRT);
+        if (idx == selected_thread) {
+            printf("%s", BACKGROUND_BLUE);
+        }
         if (threads[idx].online) {
-        printf("%s %6i %s %4i %s %6i %s %10.3f %s %8.1f %s %4d%% %s\n",
-                VRT, idx, VRT, threads[idx].core_id, VRT,
+        printf(" %6i %s %4i %s %6i %s %10.3f %s %8.1f %s %4d%% ",
+                idx, VRT, threads[idx].core_id, VRT,
                 threads[idx].online, VRT,
                 threads[idx].scaling_cur_freq, VRT,
                 threads[idx].temp, VRT,
-                threads[idx].usage.usage, VRT);
+                threads[idx].usage.usage);
         } else {
-        printf("%s %6i %s %4i %s %6i %s %10.3f %s %8.1f %s %4d%% %s\n",
-                VRT, idx, VRT, threads[idx].core_id, VRT,
+        printf(" %6i %s %4i %s %6i %s %10.3f %s %8.1f %s %4d%% ",
+                idx, VRT, threads[idx].core_id, VRT,
                 threads[idx].online, VRT,
                 0.0, VRT,
                 0.0, VRT,
-                0, VRT);
+                0);
         }
+        if (idx == selected_thread) {
+            printf("%s", NORMAL_COLOR);
+        }
+        printf("%s\n", VRT);
     }
 }
-
-
 
 // move cursor into the given position
 void move_cursor(const char* command, int hpos, int vpos) {
@@ -505,13 +562,36 @@ void move_cursor_backward(int columns) {
     printf("\033[%dD", columns);
 }
 
+void draw(const struct main_data* data, bool fullscreen_mode, const int* width, int width_sz) {
+    static bool init = true;
+
+    if (!init) {
+        // move cursor back
+        if (fullscreen_mode) {
+            move_cursor(sc_move, 0, 4);
+        } else {
+            move_cursor_up(data->thread_count);
+            move_cursor_backward(58);
+        }
+    }
+
+    init = false;
+
+    print_thread_info(data->threads, data->thread_count, data->selected_thread);
+    draw_bottom_line(width, width_sz);
+    fflush(stdout);
+}
+
 int main(int argc, char* argv[])
 {
-    bool fullscreen_mode = false;
     for (int idx = 1; idx < argc; ++idx) {
         if (strcmp(argv[idx], "--fullscreen") == 0) {
-            fullscreen_mode = true;
+            g_fullscreen_mode = true;
         }
+    }
+
+    if (geteuid() == 0) {
+        g_change_cpu_online = true;
     }
 
     char *termtype = getenv("TERM");
@@ -540,8 +620,8 @@ int main(int argc, char* argv[])
     VRT = (char *)malloc(strlen(smacs) + strlen(rmacs) + 2);
     sprintf(VRT, "%s%s%s", smacs, "\x78", rmacs);
 
-    if (fullscreen_mode && sc_init == NULL) {
-        fullscreen_mode = false;
+    if (g_fullscreen_mode && sc_init == NULL) {
+        g_fullscreen_mode = false;
     }
 
     // set custom signal handler
@@ -558,25 +638,30 @@ int main(int argc, char* argv[])
         sensors = false;
     }
 
-    // run second thread to process key presses
-    pthread_t th;
-    int ret = pthread_create(&th, NULL, &process_key_press, NULL);
-    if (ret != 0) {
-        log_err("Failed to create a thread: %s", strerror(ret));
-        return 1;
+    struct main_data data;
+    if (g_change_cpu_online) {
+        data.selected_thread = 0;
+    } else {
+        data.selected_thread = -1;
     }
 
-    struct thread_info* threads = NULL;
-    int thread_count = 0;
-    if (init_cpus(&threads, &thread_count) == -1) {
+    if (init_cpus(&(data.threads), &(data.thread_count)) == -1) {
         log_err("Error during initialization");
         return 1;
     }
 
     // init fullscreen mode
-    if (fullscreen_mode) {
+    if (g_fullscreen_mode) {
         fputs(sc_init, stdout);
         move_cursor(sc_move, 0, 0);
+    }
+
+    // run the 2nd thread to process key presses
+    pthread_t th;
+    int ret = pthread_create(&th, NULL, &process_key_press, &data);
+    if (ret != 0) {
+        log_err("Failed to create a thread: %s", strerror(ret));
+        return 1;
     }
 
     char model_name[128];
@@ -585,15 +670,18 @@ int main(int argc, char* argv[])
         printf("Processor: %s%s%s\n", BLUE, model_name, NORMAL_COLOR);
     }
 
+    if (!g_change_cpu_online) {
+        printf("Note: Setting CPUs online of offline requires root access.\n");
+        printf("      Please use sudo or root if you need it.\n");
+    }
+
     // print headers
-    int width[] = {8, 6, 8, 12, 10, 7};
-    size_t width_sz = sizeof(width) / sizeof(int);
-    draw_top_line(width, width_sz);
+    draw_top_line(g_width, g_width_sz);
     printf("\n%s %6s %s %4s %s %6s %s %10s %s %8s %s %5s %s\n",
             VRT, "Thread", VRT, "Core",
             VRT, "Online",
             VRT, "Speed, MHz", VRT, "Temp, °C" , VRT, "Usage", VRT);
-    draw_middle_line(width, width_sz);
+    draw_middle_line(g_width, g_width_sz);
     printf("\n");
 
     // set invisible cursor
@@ -603,43 +691,33 @@ int main(int argc, char* argv[])
 
     pthread_mutex_lock(&mutex1);
     while (true) {
-        if (-1 == set_online(threads, thread_count)) {
+        if (-1 == read_online(data.threads, data.thread_count)) {
             break_on_error = true;
             break;
         }
 
-        if (-1 == read_thread_info(threads, thread_count)) {
+        if (-1 == read_thread_info(data.threads, data.thread_count)) {
             break_on_error = true;
             break;
         }
 
-        if (-1 == read_thread_usage(&threads, &thread_count)) {
+        if (-1 == read_thread_usage(&(data.threads), &(data.thread_count))) {
             break_on_error = true;
             break;
         }
 
         if (sensors) {
-            if (-1 == read_cpu_temp(threads, thread_count)) {
+            if (-1 == read_cpu_temp(data.threads, data.thread_count)) {
                 break_on_error = true;
                 break;
             }
         }
 
-        print_thread_info(threads, thread_count);
-        draw_bottom_line(width, width_sz);
-        fflush(stdout);
+        draw(&data, g_fullscreen_mode, g_width, g_width_sz);
 
         // wait for 2 second
         if (wait_for(&cond, &mutex1, 2000000000) != 0) {
             break;
-        }
-
-        // move cursor back
-        if (fullscreen_mode) {
-            move_cursor(sc_move, 0, 4);
-        } else {
-            move_cursor_up(thread_count);
-            move_cursor_backward(58);
         }
     }
     pthread_mutex_unlock(&mutex1);
@@ -662,13 +740,13 @@ int main(int argc, char* argv[])
     }
 
     // exit fullscreen mode
-    if (fullscreen_mode && sc_deinit != NULL) {
+    if (g_fullscreen_mode && sc_deinit != NULL) {
         fputs(sc_deinit, stdout);
     }
 
-    free(threads);
+    free(data.threads);
 
-    if (!fullscreen_mode) {
+    if (!g_fullscreen_mode) {
         printf("\n");
     }
     return 0;
